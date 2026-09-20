@@ -1,0 +1,771 @@
+"""
+Suite de tests pour asyncvnc2.py, limitée aux formats binaires déjà vérifiés
+octet par octet en session interactive (voir features.md/CLAUDE.md) :
+RRE, CoRRE, send_set_desktop_size(), send_xvp() (+ garde-fou confirm),
+send_qemu_extended_key_event() et Extended Clipboard
+(process_extended_clipboard()/send_clipboard_*(), cf. Enc.EXTENDED_CLIPBOARD).
+Rejoue mécaniquement les scénarios déjà exécutés à la main pour qu'une
+régression future soit détectée automatiquement, sans avoir besoin d'un vrai
+serveur VNC.
+
+Lancer avec : python3 -m unittest test_asyncvnc2 -v
+"""
+
+import asyncio
+import unittest
+import zlib
+
+import numpy as np
+
+import asyncvnc2
+from asyncvnc2 import (
+    CLIPBOARD_ACTION_CAPS,
+    CLIPBOARD_ACTION_NOTIFY,
+    CLIPBOARD_ACTION_PEEK,
+    CLIPBOARD_ACTION_PROVIDE,
+    CLIPBOARD_ACTION_REQUEST,
+    CLIPBOARD_FORMAT_RTF,
+    CLIPBOARD_FORMAT_TEXT,
+    XVP_REBOOT,
+    XVP_RESET,
+    XVP_SHUTDOWN,
+    Client,
+    Clipboard,
+    Enc,
+    Keyboard,
+    Mouse,
+    Screen,
+    UpdateType,
+    Video,
+)
+
+
+def make_video(**overrides) -> Video:
+    """
+    Construit un Video minimal utilisable pour les tests, sans passer par
+    Video.create() (qui a besoin d'une vraie négociation ServerInit/
+    SetPixelFormat). Video est un @dataclass ordinaire -- l'instancier
+    directement est suffisant pour exercer le décodage RRE/CoRRE, qui
+    n'utilise que self.writer et self._update_rect().
+    """
+    fields = {
+        'reader': None,
+        'writer': _FakeWriter(),
+        'decompress': None,
+        'name': 'test',
+        'width': 64,
+        'height': 64,
+        'mode': 'rgba',
+    }
+    fields.update(overrides)
+    return Video(**fields)
+
+
+def make_client(**overrides) -> Client:
+    """
+    Construit un Client minimal utilisable pour les tests. send_xvp(),
+    send_set_desktop_size() et send_qemu_extended_key_event() vivent sur
+    Client (pas Video) et n'utilisent que self.writer -- pas besoin d'une
+    vraie négociation Client.create().
+    """
+    writer = _FakeWriter()
+    video = make_video(writer=writer)
+    fields = {
+        'reader': None,
+        'writer': writer,
+        'clipboard': Clipboard(writer=writer),
+        'keyboard': Keyboard(writer=writer),
+        'mouse': Mouse(writer=writer),
+        'video': video,
+        'host_key': None,
+    }
+    fields.update(overrides)
+    return Client(**fields)
+
+
+class _FakeWriter:
+    """Capture les octets écrits par writer.write() sans socket réel."""
+
+    def __init__(self):
+        self.sent = bytearray()
+
+    def write(self, data: bytes):
+        self.sent.extend(data)
+
+
+def _reader_from(data: bytes) -> asyncio.StreamReader:
+    """Construit un vrai asyncio.StreamReader pré-rempli avec `data`, pour
+    exercer le code de décodage (read_int/readexactly) sans socket réel."""
+    reader = asyncio.StreamReader()
+    reader.feed_data(data)
+    reader.feed_eof()
+    return reader
+
+
+class RRETests(unittest.IsolatedAsyncioTestCase):
+    """process_rre() -- 1 fond + N sous-rectangles, champs 2 octets (RFC 6143 §7.7.4)."""
+
+    async def test_background_only(self):
+        video = make_video(width=4, height=3)
+        bg = bytes([10, 20, 30, 255])
+        stream = (0).to_bytes(4, 'big') + bg  # n=0 sous-rectangle
+        await video.process_rre(_reader_from(stream), x=0, y=0, width=4, height=3)
+        expected = np.ndarray((3, 4, 4), 'B', bg * 12)
+        self.assertTrue((video.data[0:3, 0:4, :] == expected).all())
+
+    async def test_one_subrectangle_2byte_fields(self):
+        video = make_video(width=10, height=10)
+        bg = bytes([0, 0, 0, 255])
+        colour = bytes([255, 0, 0, 255])
+        # sous-rectangle à (2,3), 4x5, avec des champs 2 octets (>255, pour
+        # bien distinguer RRE de CoRRE si jamais les deux étaient confondus)
+        sub = (
+            colour
+            + (2).to_bytes(2, 'big')
+            + (3).to_bytes(2, 'big')
+            + (4).to_bytes(2, 'big')
+            + (5).to_bytes(2, 'big')
+        )
+        stream = (1).to_bytes(4, 'big') + bg + sub
+        await video.process_rre(_reader_from(stream), x=0, y=0, width=10, height=10)
+        # fond partout sauf le sous-rectangle
+        self.assertTrue((video.data[0, 0, :] == np.frombuffer(bg, 'B')).all())
+        self.assertTrue((video.data[3:8, 2:6, :] == np.frombuffer(colour, 'B')).all())
+
+
+class CoRRETests(unittest.IsolatedAsyncioTestCase):
+    """process_corre() -- comme RRE mais champs 1 octet, garde-fou 255x255."""
+
+    async def test_one_subrectangle_1byte_fields(self):
+        video = make_video(width=20, height=20)
+        bg = bytes([1, 2, 3, 255])
+        colour = bytes([9, 9, 9, 255])
+        sub = colour + bytes([2, 3, 4, 5])  # sx, sy, sw, sh en 1 octet chacun
+        stream = (1).to_bytes(4, 'big') + bg + sub
+        await video.process_corre(_reader_from(stream), x=0, y=0, width=20, height=20)
+        self.assertTrue((video.data[0, 0, :] == np.frombuffer(bg, 'B')).all())
+        self.assertTrue((video.data[3:8, 2:6, :] == np.frombuffer(colour, 'B')).all())
+
+    async def test_255x255_limit_enforced(self):
+        video = make_video(width=256, height=100)
+        with self.assertRaises(ValueError):
+            await video.process_corre(_reader_from(b''), x=0, y=0, width=256, height=100)
+
+    async def test_255x255_boundary_allowed(self):
+        # 255x255 est la limite légale (pas 256) -- ne doit PAS lever.
+        video = make_video(width=255, height=255)
+        bg = bytes([0, 0, 0, 255])
+        stream = (0).to_bytes(4, 'big') + bg
+        await video.process_corre(_reader_from(stream), x=0, y=0, width=255, height=255)
+        self.assertTrue((video.data[0, 0, :] == np.frombuffer(bg, 'B')).all())
+
+
+class ZywrleTests(unittest.IsolatedAsyncioTestCase):
+    """
+    Enc.ZYWRLE (17) -- voir docs/sessions/session-11-2026-09-09.md pour
+    l'investigation complète contre un vrai QEMU 8.2.2. Ce qui EST vérifié ici
+    (byte-exact, sans serveur réel) :
+      1) une tuile ZRLE "standard" (subencoding 0/1/2-16/127/128/130-255) est
+         décodée à l'identique que le raw_encoding négocié soit 16 (ZRLE) ou
+         17 (ZYWRLE) -- même chemin de code (process_xrle) ;
+      2) une valeur de subencoding 17-126 (réservée par rfbproto.rst/RFC
+         6143, mais réellement envoyée par QEMU 8.2.2 une fois son vrai
+         chemin lossy ZYWRLE engagé) est refusée explicitement (ValueError)
+         plutôt que décodée au hasard ;
+      3) Enc.default() n'annonce PAS ZYWRLE (opt-in manuel uniquement).
+    Ce qui n'est PAS vérifié ici (pas de format documenté ni confirmé) :
+    le contenu réel d'une tuile QEMU ZYWRLE avec subencoding 17-126.
+    """
+
+    @staticmethod
+    def _zrle_rect_stream(encoding_value: int, tile: bytes) -> bytes:
+        compressor = zlib.compressobj()
+        compressed = compressor.compress(tile) + compressor.flush()
+        header = (0).to_bytes(2, 'big') * 2 + (4).to_bytes(2, 'big') + (3).to_bytes(2, 'big')
+        return (
+            header
+            + encoding_value.to_bytes(4, 'big', signed=True)
+            + len(compressed).to_bytes(4, 'big')
+            + compressed
+        )
+
+    async def test_zywrle_decodes_like_zrle_for_a_standard_raw_tile(self):
+        pixel = bytes([11, 22, 33])
+        tile = bytes([0]) + pixel * (4 * 3)  # subencoding=0 (Raw), tuile 4x3
+        expected = np.ndarray((3, 4, 3), 'B', pixel * 12)
+        for encoding_value in (Enc.ZRLE.value, Enc.ZYWRLE.value):
+            video = make_video(width=4, height=3, decompress=zlib.decompressobj())
+            video.reader = _reader_from(self._zrle_rect_stream(encoding_value, tile))
+            await video.read()
+            self.assertTrue(
+                (video.data[0:3, 0:4, :3] == expected).all(),
+                f'échec pour raw_encoding={encoding_value}',
+            )
+
+    async def test_reserved_subencoding_range_raises_valueerror(self):
+        # subencoding=28 : exactement la valeur vue en conditions réelles
+        # contre QEMU 8.2.2 (-vnc :N,lossy=on, jpeg_quality<9) une fois son
+        # vrai chemin ZYWRLE engagé -- voir session-11.
+        tile = bytes([28])
+        video = make_video(width=4, height=3, decompress=zlib.decompressobj())
+        video.reader = _reader_from(self._zrle_rect_stream(Enc.ZYWRLE.value, tile))
+        with self.assertRaises(ValueError):
+            await video.read()
+
+    def test_default_encodings_excludes_zywrle(self):
+        self.assertNotIn(Enc.ZYWRLE, list(Enc.default()))
+        self.assertIn(Enc.ZRLE, list(Enc.default()))
+
+
+class SendSetDesktopSizeTests(unittest.IsolatedAsyncioTestCase):
+    """send_set_desktop_size() -- message client type 251 (RFC officielle)."""
+
+    async def test_implicit_single_screen_24_bytes(self):
+        client = make_client()
+        await client.send_set_desktop_size(1920, 1080)
+        sent = bytes(client.writer.sent)
+        self.assertEqual(len(sent), 24)
+        self.assertEqual(sent[0], 251)
+        self.assertEqual(sent[1], 0)  # padding
+        self.assertEqual(int.from_bytes(sent[2:4], 'big'), 1920)
+        self.assertEqual(int.from_bytes(sent[4:6], 'big'), 1080)
+        self.assertEqual(sent[6], 1)  # 1 écran implicite
+        self.assertEqual(sent[7], 0)  # padding
+        screen = sent[8:24]
+        self.assertEqual(int.from_bytes(screen[0:4], 'big'), 0)  # id
+        self.assertEqual(int.from_bytes(screen[4:6], 'big'), 0)  # x
+        self.assertEqual(int.from_bytes(screen[6:8], 'big'), 0)  # y
+        self.assertEqual(int.from_bytes(screen[8:10], 'big'), 1920)
+        self.assertEqual(int.from_bytes(screen[10:12], 'big'), 1080)
+        self.assertEqual(int.from_bytes(screen[12:16], 'big'), 0)  # flags
+
+    async def test_explicit_two_screens_40_bytes(self):
+        client = make_client()
+        screens = [
+            Screen(0, 0, 1280, 1080, id=1, flags=0),
+            Screen(1280, 0, 1280, 1080, id=2, flags=0),
+        ]
+        await client.send_set_desktop_size(2560, 1080, screens=screens)
+        sent = bytes(client.writer.sent)
+        self.assertEqual(len(sent), 40)
+        self.assertEqual(sent[6], 2)  # 2 écrans explicites
+
+
+class SendQemuExtendedKeyEventTests(unittest.IsolatedAsyncioTestCase):
+    """send_qemu_extended_key_event() -- extension QEMU, 12 octets (ui/vnc.c)."""
+
+    async def test_key_down_12_bytes(self):
+        client = make_client()
+        await client.send_qemu_extended_key_event(down=True, keysym=0x61, keycode=30)
+        sent = bytes(client.writer.sent)
+        self.assertEqual(len(sent), 12)
+        self.assertEqual(sent[0], 255)  # message-type QEMU
+        self.assertEqual(sent[1], 0)  # submessage-type EXT_KEY_EVENT
+        self.assertEqual(int.from_bytes(sent[2:4], 'big'), 1)  # down-flag U16
+        self.assertEqual(int.from_bytes(sent[4:8], 'big'), 0x61)  # keysym U32
+        self.assertEqual(int.from_bytes(sent[8:12], 'big'), 30)  # keycode U32
+
+    async def test_key_up_high_u32_values(self):
+        client = make_client()
+        await client.send_qemu_extended_key_event(down=False, keysym=0xFFFFFFFF, keycode=0xFFFFFFFF)
+        sent = bytes(client.writer.sent)
+        self.assertEqual(int.from_bytes(sent[2:4], 'big'), 0)  # down-flag = False
+        self.assertEqual(int.from_bytes(sent[4:8], 'big'), 0xFFFFFFFF)
+        self.assertEqual(int.from_bytes(sent[8:12], 'big'), 0xFFFFFFFF)
+
+
+class SendXvpTests(unittest.IsolatedAsyncioTestCase):
+    """send_xvp() -- message type 250 + garde-fou confirm=True (2026-09-06)."""
+
+    async def test_refused_without_confirm(self):
+        client = make_client()
+        with self.assertRaises(PermissionError):
+            await client.send_xvp(XVP_SHUTDOWN)
+        self.assertEqual(len(client.writer.sent), 0)  # aucune écriture socket
+
+    async def test_sent_with_confirm_4_bytes(self):
+        client = make_client()
+        await client.send_xvp(XVP_REBOOT, confirm=True)
+        sent = bytes(client.writer.sent)
+        self.assertEqual(sent, bytes([250, 0, 1, XVP_REBOOT]))
+
+    async def test_invalid_code_raises_valueerror_before_confirm_check(self):
+        client = make_client()
+        # code invalide : ValueError, même sans confirm=True (priorité déjà
+        # vérifiée manuellement -- on la rejoue ici automatiquement)
+        with self.assertRaises(ValueError):
+            await client.send_xvp(99)
+        self.assertEqual(len(client.writer.sent), 0)
+
+    async def test_wrapper_methods_relay_confirm(self):
+        client = make_client()
+        await client.send_xvp_reset(confirm=True)
+        self.assertEqual(bytes(client.writer.sent), bytes([250, 0, 1, XVP_RESET]))
+
+
+def _clipboard_message(flags: int, body_after_flags: bytes = b'') -> bytes:
+    """Construit un ServerCutText étendu complet (type 3, longueur S32
+    négative) tel qu'il arriverait sur le fil, pour alimenter Client.read()."""
+    body = flags.to_bytes(4, 'big') + body_after_flags
+    return bytes([3, 0, 0, 0]) + (-len(body)).to_bytes(4, 'big', signed=True) + body
+
+
+def _provide_payload(
+    text: str | None = None, extra_pairs: bytes = b'', extra_flags: int = 0
+) -> tuple[int, bytes]:
+    """Construit (flags, corps-après-flags) d'un Provide texte, avec des
+    paires de formats supplémentaires optionnelles APRÈS le texte (le texte
+    est le bit 0 -- le plus bas -- donc toujours la première paire dans un
+    flux valide ; ceci vérifie qu'un format de bit plus élevé placé ensuite
+    est bien ignoré sans désynchroniser)."""
+    flags = CLIPBOARD_ACTION_PROVIDE | CLIPBOARD_FORMAT_TEXT | extra_flags
+    inner = b''
+    if text is not None:
+        data = text.encode('utf-8') + b'\x00'
+        inner += len(data).to_bytes(4, 'big') + data
+    inner += extra_pairs
+    return flags, zlib.compress(inner)
+
+
+class ProcessExtendedClipboardTests(unittest.IsolatedAsyncioTestCase):
+    """process_extended_clipboard() -- Caps/Notify/Peek/Request/Provide (rfbproto.rst
+    "Extended Clipboard Pseudo-Encoding"), vérifié le 2026-09-13 contre un vrai
+    TigerVNC/Xvnc 1.13.1 et un vrai QEMU 8.2.2 (voir docs/sessions/session-14)."""
+
+    def test_pseudo_encoding_value_and_included_by_default(self):
+        self.assertEqual(Enc.EXTENDED_CLIPBOARD.value, -1063131698)
+        self.assertEqual(Enc.EXTENDED_CLIPBOARD.value & 0xFFFFFFFF, 0xC0A1E5CE)
+        self.assertIn(Enc.EXTENDED_CLIPBOARD, list(Enc.default()))  # sûr à annoncer, cf. Enc.XVP
+
+    async def test_caps_sets_supported_flag_and_stores_sizes(self):
+        client = make_client()
+        flags = CLIPBOARD_ACTION_CAPS | CLIPBOARD_FORMAT_TEXT
+        client.reader = _reader_from(flags.to_bytes(4, 'big') + (0).to_bytes(4, 'big'))
+        await client.process_extended_clipboard(8)
+        self.assertTrue(client.clipboard_ext_supported)
+        self.assertEqual(client.clipboard_ext_server_caps, {CLIPBOARD_FORMAT_TEXT: 0})
+
+    async def test_caps_multiple_formats_sizes_in_bit_order(self):
+        client = make_client()
+        flags = CLIPBOARD_ACTION_CAPS | CLIPBOARD_FORMAT_TEXT | CLIPBOARD_FORMAT_RTF
+        body = (
+            flags.to_bytes(4, 'big')
+            + (20 * 1024 * 1024).to_bytes(4, 'big')
+            + (0).to_bytes(4, 'big')
+        )
+        client.reader = _reader_from(body)
+        await client.process_extended_clipboard(len(body))
+        self.assertEqual(
+            client.clipboard_ext_server_caps,
+            {CLIPBOARD_FORMAT_TEXT: 20 * 1024 * 1024, CLIPBOARD_FORMAT_RTF: 0},
+        )
+
+    async def test_notify_does_not_touch_clipboard_text(self):
+        client = make_client()
+        client.clipboard.text = 'inchangé'
+        flags = CLIPBOARD_ACTION_NOTIFY | CLIPBOARD_FORMAT_TEXT
+        client.reader = _reader_from(flags.to_bytes(4, 'big'))
+        await client.process_extended_clipboard(4)
+        self.assertFalse(client.clipboard_ext_supported)  # Notify seul ne confirme pas le support
+        self.assertEqual(client.clipboard.text, 'inchangé')
+
+    async def test_peek_and_request_do_not_crash_or_touch_state(self):
+        client = make_client()
+        for action in (CLIPBOARD_ACTION_PEEK, CLIPBOARD_ACTION_REQUEST):
+            client.reader = _reader_from((action | CLIPBOARD_FORMAT_TEXT).to_bytes(4, 'big'))
+            await client.process_extended_clipboard(4)  # ne doit pas lever
+
+    async def test_provide_decodes_utf8_text_with_trailing_nul(self):
+        client = make_client()
+        flags, body = _provide_payload('café — 日本語')
+        client.reader = _reader_from(flags.to_bytes(4, 'big') + body)
+        await client.process_extended_clipboard(4 + len(body))
+        self.assertEqual(client.clipboard.text, 'café — 日本語')
+
+    async def test_provide_without_trailing_nul_still_decodes(self):
+        # Défensif : la spec exige un NUL terminal à l'émission, mais certains
+        # pairs pourraient s'en dispenser -- on ne doit pas planter pour autant.
+        client = make_client()
+        data = b'sans NUL'
+        inner = len(data).to_bytes(4, 'big') + data
+        compressed = zlib.compress(inner)
+        flags = CLIPBOARD_ACTION_PROVIDE | CLIPBOARD_FORMAT_TEXT
+        body = flags.to_bytes(4, 'big') + compressed
+        client.reader = _reader_from(body)
+        await client.process_extended_clipboard(len(body))
+        self.assertEqual(client.clipboard.text, 'sans NUL')
+
+    async def test_provide_extra_unsupported_format_is_skipped_not_decoded(self):
+        # RTF après le texte dans le flux (bit 1 > bit 0) : doit être sauté
+        # correctement (pas de désynchronisation) sans jamais être exposé/
+        # décodé (non implémenté).
+        rtf = b'{\\rtf1 fake}'
+        extra_pairs = len(rtf).to_bytes(4, 'big') + rtf
+        flags, body = _provide_payload(
+            'texte seul décodé', extra_pairs=extra_pairs, extra_flags=CLIPBOARD_FORMAT_RTF
+        )
+        client = make_client()
+        client.reader = _reader_from(flags.to_bytes(4, 'big') + body)
+        await client.process_extended_clipboard(4 + len(body))
+        self.assertEqual(client.clipboard.text, 'texte seul décodé')
+
+    async def test_message_shorter_than_4_bytes_raises_valueerror(self):
+        client = make_client()
+        client.reader = _reader_from(b'')
+        with self.assertRaises(ValueError):
+            await client.process_extended_clipboard(2)
+
+    async def test_truncated_provide_size_field_raises_valueerror(self):
+        client = make_client()
+        compressed = zlib.compress(b'\x00\x00')  # 2 octets : trop court pour une taille U32
+        flags = CLIPBOARD_ACTION_PROVIDE | CLIPBOARD_FORMAT_TEXT
+        body = flags.to_bytes(4, 'big') + compressed
+        client.reader = _reader_from(body)
+        with self.assertRaises(ValueError):
+            await client.process_extended_clipboard(len(body))
+
+    async def test_truncated_provide_data_raises_valueerror(self):
+        client = make_client()
+        inner = (1000).to_bytes(
+            4, 'big'
+        ) + b'trop court'  # annonce 1000 octets, n'en fournit pas assez
+        compressed = zlib.compress(inner)
+        flags = CLIPBOARD_ACTION_PROVIDE | CLIPBOARD_FORMAT_TEXT
+        body = flags.to_bytes(4, 'big') + compressed
+        client.reader = _reader_from(body)
+        with self.assertRaises(ValueError):
+            await client.process_extended_clipboard(len(body))
+
+    async def test_oversized_decompressed_payload_raises_valueerror(self):
+        original_cap = asyncvnc2._MAX_ALLOC_BYTES
+        asyncvnc2._MAX_ALLOC_BYTES = 64  # plafond artificiellement bas pour ce test
+        try:
+            compressed = zlib.compress(b'A' * 10_000)
+            flags = CLIPBOARD_ACTION_PROVIDE | CLIPBOARD_FORMAT_TEXT
+            body = flags.to_bytes(4, 'big') + compressed
+            client = make_client()
+            client.reader = _reader_from(body)
+            with self.assertRaises(ValueError):
+                await client.process_extended_clipboard(len(body))
+        finally:
+            asyncvnc2._MAX_ALLOC_BYTES = original_cap
+
+    async def test_invalid_zlib_stream_raises_valueerror(self):
+        client = make_client()
+        flags = CLIPBOARD_ACTION_PROVIDE | CLIPBOARD_FORMAT_TEXT
+        body = flags.to_bytes(4, 'big') + b'ceci-n-est-pas-du-zlib'
+        client.reader = _reader_from(body)
+        with self.assertRaises(ValueError):
+            await client.process_extended_clipboard(len(body))
+
+    async def test_no_desync_two_consecutive_messages(self):
+        # Un Caps étendu suivi d'un ServerCutText Latin-1 classique dans le
+        # même flux : les deux doivent se décoder correctement l'un après
+        # l'autre, sans que le premier ne consomme un octet de trop ou de
+        # travers sur le second.
+        client = make_client()
+        caps_msg = _clipboard_message(
+            CLIPBOARD_ACTION_CAPS | CLIPBOARD_FORMAT_TEXT, (0).to_bytes(4, 'big')
+        )
+        latin1_text = 'café'.encode('latin-1')
+        latin1_msg = bytes([3, 0, 0, 0]) + len(latin1_text).to_bytes(4, 'big') + latin1_text
+        client.reader = _reader_from(caps_msg + latin1_msg)
+        self.assertEqual(await client.read(), UpdateType.CLIPBOARD)
+        self.assertTrue(client.clipboard_ext_supported)
+        self.assertEqual(await client.read(), UpdateType.CLIPBOARD)
+        self.assertEqual(client.clipboard.text, 'café')
+
+
+class ClientReadClipboardRegressionTests(unittest.IsolatedAsyncioTestCase):
+    """Client.read() / UpdateType.CLIPBOARD -- non-régression du chemin Latin-1
+    d'origine après le passage à une longueur S32 signée (2026-09-13)."""
+
+    async def test_basic_latin1_positive_length_unaffected(self):
+        client = make_client()
+        text = 'café'.encode('latin-1')
+        msg = bytes([3, 0, 0, 0]) + len(text).to_bytes(4, 'big') + text
+        client.reader = _reader_from(msg)
+        self.assertEqual(await client.read(), UpdateType.CLIPBOARD)
+        self.assertEqual(client.clipboard.text, 'café')
+        self.assertFalse(client.clipboard_ext_supported)
+
+
+class SendClipboardTests(unittest.IsolatedAsyncioTestCase):
+    """send_clipboard_caps/notify/request/provide/update() -- garde-fou
+    clipboard_ext_supported et formats sur le fil, vérifiés le 2026-09-13
+    contre un vrai TigerVNC/Xvnc 1.13.1 et un vrai QEMU 8.2.2."""
+
+    async def test_all_send_methods_refused_without_ext_supported(self):
+        client = make_client()
+        for coro in (
+            client.send_clipboard_caps(),
+            client.send_clipboard_notify(),
+            client.send_clipboard_request(),
+            client.send_clipboard_provide('x'),
+        ):
+            with self.assertRaises(PermissionError):
+                await coro
+        self.assertEqual(len(client.writer.sent), 0)
+
+    async def test_send_clipboard_notify_wire_format(self):
+        client = make_client()
+        client.clipboard_ext_supported = True
+        await client.send_clipboard_notify()
+        expected_flags = CLIPBOARD_ACTION_NOTIFY | CLIPBOARD_FORMAT_TEXT
+        expected = (
+            bytes([6, 0, 0, 0])
+            + (-4).to_bytes(4, 'big', signed=True)
+            + expected_flags.to_bytes(4, 'big')
+        )
+        self.assertEqual(bytes(client.writer.sent), expected)
+
+    async def test_send_clipboard_request_wire_format(self):
+        client = make_client()
+        client.clipboard_ext_supported = True
+        await client.send_clipboard_request()
+        expected_flags = CLIPBOARD_ACTION_REQUEST | CLIPBOARD_FORMAT_TEXT
+        expected = (
+            bytes([6, 0, 0, 0])
+            + (-4).to_bytes(4, 'big', signed=True)
+            + expected_flags.to_bytes(4, 'big')
+        )
+        self.assertEqual(bytes(client.writer.sent), expected)
+
+    async def test_send_clipboard_caps_wire_format(self):
+        client = make_client()
+        client.clipboard_ext_supported = True
+        await client.send_clipboard_caps(max_text_size=1234)
+        sent = bytes(client.writer.sent)
+        self.assertEqual(sent[0], 6)
+        length = int.from_bytes(sent[4:8], 'big', signed=True)
+        self.assertEqual(length, -8)
+        flags = int.from_bytes(sent[8:12], 'big')
+        self.assertTrue(flags & CLIPBOARD_ACTION_CAPS)
+        self.assertTrue(flags & CLIPBOARD_FORMAT_TEXT)
+        self.assertEqual(int.from_bytes(sent[12:16], 'big'), 1234)
+
+    async def test_send_clipboard_provide_round_trips_through_process(self):
+        sender = make_client()
+        sender.clipboard_ext_supported = True
+        text = 'texte à relayer — 中文 — ✅'
+        await sender.send_clipboard_provide(text)
+        sent = bytes(sender.writer.sent)
+        self.assertEqual(sent[0], 6)
+        length = int.from_bytes(sent[4:8], 'big', signed=True)
+        self.assertLess(length, 0)
+
+        receiver = make_client()
+        receiver.clipboard_ext_supported = True
+        receiver.reader = _reader_from(sent[8 : 8 + (-length)])
+        await receiver.process_extended_clipboard(-length)
+        self.assertEqual(receiver.clipboard.text, text)
+
+    async def test_send_clipboard_update_sends_notify_then_provide(self):
+        # Ordre exigé en pratique par TigerVNC et QEMU (voir
+        # send_clipboard_provide()) : Notify avant Provide, jamais l'inverse.
+        client = make_client()
+        client.clipboard_ext_supported = True
+        await client.send_clipboard_update('bonjour')
+        sent = bytes(client.writer.sent)
+        first_flags = int.from_bytes(sent[8:12], 'big')
+        self.assertEqual(first_flags, CLIPBOARD_ACTION_NOTIFY | CLIPBOARD_FORMAT_TEXT)
+        second_length = int.from_bytes(sent[16:20], 'big', signed=True)
+        second_flags = int.from_bytes(sent[20:24], 'big')
+        self.assertLess(second_length, 0)
+        self.assertEqual(second_flags, CLIPBOARD_ACTION_PROVIDE | CLIPBOARD_FORMAT_TEXT)
+
+
+class EaxPrimitivesTests(unittest.IsolatedAsyncioTestCase):
+    """
+    _eax_seal()/_eax_open()/_eax_increment_counter() -- les primitives
+    AES-EAX ajoutées pour RSA-AES (RA2/RA2_256, cf. _rsa_aes_negotiate()).
+    Contrairement au reste de VeNCrypt/RSA-AES (délibérément non
+    testé unitairement, cf. l'en-tête de ce fichier -- nécessiterait un
+    vrai serveur), ces fonctions sont pures et déterministes : testables
+    sans aucun serveur. La poignée de main RSA-AES complète, elle, a été
+    testée le 2026-09-15 contre un vrai TigerVNC/Xvnc 1.13.1 pour RA2 et
+    RA2_256, voir docs/sessions/session-17-2026-09-15.md -- c'est ce test
+    réel, pas celui-ci, qui a débusqué le piège de troncature de clé de
+    session que test_seal_open_round_trip_both_key_sizes revérifie
+    désormais mécaniquement.
+    """
+
+    def test_seal_open_round_trip_both_key_sizes(self):
+        for key_size in (16, 32):  # AES-128 (RA2) et AES-256 (RA2_256)
+            key = bytes(range(key_size))
+            nonce = bytes(16)
+            header = (42).to_bytes(2, 'big')
+            plaintext = b'un message de taille arbitraire, pas forcement multiple de 16'
+            ciphertext, tag = asyncvnc2._eax_seal(key, nonce, header, plaintext)
+            self.assertEqual(len(tag), 16)
+            self.assertEqual(len(ciphertext), len(plaintext))
+            decrypted = asyncvnc2._eax_open(key, nonce, header, ciphertext, tag)
+            self.assertEqual(decrypted, plaintext)
+
+    def test_open_rejects_tampered_ciphertext(self):
+        key = bytes(range(16))
+        nonce = bytes(16)
+        header = (5).to_bytes(2, 'big')
+        ciphertext, tag = asyncvnc2._eax_seal(key, nonce, header, b'texte original')
+        tampered = bytes([ciphertext[0] ^ 0xFF]) + ciphertext[1:]
+        with self.assertRaises(ValueError):
+            asyncvnc2._eax_open(key, nonce, header, tampered, tag)
+
+    def test_open_rejects_tampered_tag(self):
+        key = bytes(range(16))
+        nonce = bytes(16)
+        header = (5).to_bytes(2, 'big')
+        ciphertext, tag = asyncvnc2._eax_seal(key, nonce, header, b'texte original')
+        tampered_tag = bytes([tag[0] ^ 0xFF]) + tag[1:]
+        with self.assertRaises(ValueError):
+            asyncvnc2._eax_open(key, nonce, header, ciphertext, tampered_tag)
+
+    def test_open_rejects_wrong_header(self):
+        # Le préfixe de longueur fait partie des données authentifiées :
+        # rejouer le même chiffré+tag avec une longueur différente doit
+        # échouer, pas juste être ignoré silencieusement.
+        key = bytes(range(16))
+        nonce = bytes(16)
+        ciphertext, tag = asyncvnc2._eax_seal(key, nonce, (5).to_bytes(2, 'big'), b'texte original')
+        with self.assertRaises(ValueError):
+            asyncvnc2._eax_open(key, nonce, (6).to_bytes(2, 'big'), ciphertext, tag)
+
+    def test_different_nonces_produce_different_ciphertexts(self):
+        key = bytes(range(16))
+        header = (4).to_bytes(2, 'big')
+        plaintext = b'meme message'
+        c1, t1 = asyncvnc2._eax_seal(key, bytes(16), header, plaintext)
+        c2, t2 = asyncvnc2._eax_seal(key, (1).to_bytes(16, 'little'), header, plaintext)
+        self.assertNotEqual(c1, c2)
+        self.assertNotEqual(t1, t2)
+
+    def test_increment_counter_little_endian_with_carry(self):
+        counter = bytearray(16)
+        asyncvnc2._eax_increment_counter(counter)
+        self.assertEqual(bytes(counter), (1).to_bytes(16, 'little'))
+        counter = bytearray(b'\xff' + bytes(15))  # octet de poids faible déjà à 0xff
+        asyncvnc2._eax_increment_counter(counter)
+        self.assertEqual(
+            bytes(counter), (256).to_bytes(16, 'little')
+        )  # retenue vers l'octet suivant
+
+
+def _sasl_server_start_message(serverout: bytes, complete_flag: int) -> bytes:
+    """Construit un message "SASL server start message" (rfbproto.rst,
+    section SASL) tel qu'un vrai serveur l'enverrait : U32 longueur +
+    serverout-data (bourrage NUL déjà inclus si besoin, à la charge de
+    l'appelant, exactement comme pour clientout côté client) + U8
+    complete-flag."""
+    return len(serverout).to_bytes(4, 'big') + serverout + bytes([complete_flag])
+
+
+class SaslNegotiateTests(unittest.IsolatedAsyncioTestCase):
+    """
+    _sasl_negotiate() -- security type 20, mécanismes PLAIN (RFC 4616) et
+    ANONYMOUS (RFC 4505) uniquement (voir sa docstring pour le détail du
+    tramage et des mécanismes volontairement non pris en charge).
+
+    Comme pour MSLogonII (security type 113), aucun serveur SASL de
+    référence n'est installable dans ce sandbox -- ces tests vérifient
+    donc la cohérence interne du tramage envoyé/attendu contre la lecture
+    de rfbproto.rst, via un "serveur" fabriqué à la main (round-trip
+    auto-cohérent), pas contre une véritable implémentation SASL tierce.
+    """
+
+    async def test_plain_chosen_when_offered_with_credentials(self):
+        # mechlist offrant PLAIN et ANONYMOUS : PLAIN doit être préféré dès
+        # que des identifiants sont fournis (mécanisme authentifié, pas
+        # seulement anonyme).
+        mechlist = b'ANONYMOUS,PLAIN'
+        server_bytes = (
+            len(mechlist).to_bytes(4, 'big') + mechlist + _sasl_server_start_message(b'', 1)
+        )
+        reader = _reader_from(server_bytes)
+        writer = _FakeWriter()
+        await asyncvnc2._sasl_negotiate(reader, writer, 'mathilde', 's3cret')
+
+        sent = bytes(writer.sent)
+        mechname_length = int.from_bytes(sent[0:4], 'big')
+        mechname = sent[4 : 4 + mechname_length]
+        self.assertEqual(mechname, b'PLAIN')
+        offset = 4 + mechname_length
+        clientout_length = int.from_bytes(sent[offset : offset + 4], 'big')
+        clientout_padded = sent[offset + 4 : offset + 4 + clientout_length]
+        self.assertEqual(offset + 4 + clientout_length, len(sent))  # rien après
+        clientout = clientout_padded[:-1]  # retrait du NUL de bourrage
+        self.assertEqual(clientout_padded[-1], 0)
+        # RFC 4616 : authzid (vide) NUL authcid NUL passwd
+        self.assertEqual(clientout, b'\x00mathilde\x00s3cret')
+
+    async def test_anonymous_used_when_plain_not_offered(self):
+        mechlist = b'ANONYMOUS'
+        server_bytes = (
+            len(mechlist).to_bytes(4, 'big') + mechlist + _sasl_server_start_message(b'', 1)
+        )
+        reader = _reader_from(server_bytes)
+        writer = _FakeWriter()
+        await asyncvnc2._sasl_negotiate(reader, writer, 'trace-info', None)
+
+        sent = bytes(writer.sent)
+        mechname_length = int.from_bytes(sent[0:4], 'big')
+        self.assertEqual(sent[4 : 4 + mechname_length], b'ANONYMOUS')
+        offset = 4 + mechname_length
+        clientout_length = int.from_bytes(sent[offset : offset + 4], 'big')
+        clientout_padded = sent[offset + 4 : offset + 4 + clientout_length]
+        self.assertEqual(clientout_padded, b'trace-info\x00')  # RFC 4505 + bourrage NUL
+
+    async def test_anonymous_with_no_username_sends_empty_message(self):
+        mechlist = b'ANONYMOUS'
+        server_bytes = (
+            len(mechlist).to_bytes(4, 'big') + mechlist + _sasl_server_start_message(b'', 1)
+        )
+        reader = _reader_from(server_bytes)
+        writer = _FakeWriter()
+        await asyncvnc2._sasl_negotiate(reader, writer, None, None)
+
+        sent = bytes(writer.sent)
+        mechname_length = int.from_bytes(sent[0:4], 'big')
+        offset = 4 + mechname_length
+        clientout_length = int.from_bytes(sent[offset : offset + 4], 'big')
+        clientout_padded = sent[offset + 4 : offset + 4 + clientout_length]
+        self.assertEqual(clientout_padded, b'\x00')  # message vide + seul le bourrage NUL
+
+    async def test_no_supported_mechanism_raises_valueerror(self):
+        mechlist = b'DIGEST-MD5,GSSAPI'
+        reader = _reader_from(len(mechlist).to_bytes(4, 'big') + mechlist)
+        writer = _FakeWriter()
+        with self.assertRaises(ValueError):
+            await asyncvnc2._sasl_negotiate(reader, writer, 'mathilde', 's3cret')
+        self.assertEqual(len(writer.sent), 0)  # aucune écriture avant l'échec
+
+    async def test_empty_mechlist_raises_valueerror(self):
+        reader = _reader_from((0).to_bytes(4, 'big'))
+        writer = _FakeWriter()
+        with self.assertRaises(ValueError):
+            await asyncvnc2._sasl_negotiate(reader, writer, 'mathilde', 's3cret')
+
+    async def test_plain_only_offered_without_credentials_falls_back_to_error(self):
+        # PLAIN seul offert, mais ni username ni password fournis, et
+        # ANONYMOUS absent de la liste -- aucun mécanisme utilisable.
+        mechlist = b'PLAIN'
+        reader = _reader_from(len(mechlist).to_bytes(4, 'big') + mechlist)
+        writer = _FakeWriter()
+        with self.assertRaises(ValueError):
+            await asyncvnc2._sasl_negotiate(reader, writer, None, None)
+
+    async def test_multi_step_exchange_rejected(self):
+        # complete-flag=0 : le serveur attend une étape supplémentaire,
+        # jamais prévue pour PLAIN/ANONYMOUS -- refusé explicitement
+        # plutôt que deviné (même principe que pour ZYWRLE ci-dessus).
+        mechlist = b'ANONYMOUS'
+        server_bytes = (
+            len(mechlist).to_bytes(4, 'big') + mechlist + _sasl_server_start_message(b'', 0)
+        )
+        reader = _reader_from(server_bytes)
+        writer = _FakeWriter()
+        with self.assertRaises(ValueError):
+            await asyncvnc2._sasl_negotiate(reader, writer, None, None)
+
+
+if __name__ == '__main__':
+    unittest.main()

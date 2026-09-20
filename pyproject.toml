@@ -1,0 +1,31 @@
+[project]
+name = "asyncvnc2"
+version = "0.1.0"
+description = "Fork maison d'asyncvnc (client/serveur RFB pur Python, VNC) avec patches xvp, listen(), repli de version, VeNCrypt, WebSockets, Extended Clipboard, RSA-AES"
+readme = "docs/reference/downstream-consumer.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "loguru>=0.7",
+    "cryptography>=41.0",
+    "keysymdef>=1.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.format]
+quote-style = "single"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+include = ["asyncvnc2.py"]
